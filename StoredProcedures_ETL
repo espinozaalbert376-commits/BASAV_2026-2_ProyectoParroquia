@@ -1,0 +1,434 @@
+-- ============================================================================
+-- ARCHIVO: 03_StoredProcedures_ETL.sql
+-- PROYECTO: BASAV 2026-2 - Parroquia Nuestra Señora de la Paz
+-- DESCRIPCIÓN: Procedimientos almacenados modulares del pipeline ETL:
+--              1) dw.usp_ETL_Cargar_Dimensiones (con HASHBYTES SHA2_256)
+--              2) dw.usp_ETL_Cargar_Fact_Sacramento
+--              3) dw.usp_ETL_Cargar_Fact_Finanzas
+--              4) dw.usp_Orquestador_ETL_Principal (transaccional + log)
+-- ============================================================================
+USE BD_DW_Parroquia;
+GO
+
+-- ============================================================================
+-- SP 1: CARGA DE DIMENSIONES
+-- ============================================================================
+CREATE OR ALTER PROCEDURE dw.usp_ETL_Cargar_Dimensiones
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- 1. Dim_Ubicacion
+    IF NOT EXISTS (SELECT 1 FROM dw.Dim_Ubicacion WHERE NombreSede = 'Parroquia Nuestra Señora de la Paz')
+    BEGIN
+        INSERT INTO dw.Dim_Ubicacion (NombreSede, TipoSede, Zona)
+        VALUES ('Parroquia Nuestra Señora de la Paz', 'Sede Principal', 'San Juan de Lurigancho');
+    END
+
+    -- 2. Dim_TipoSacramento
+    INSERT INTO dw.Dim_TipoSacramento (CodigoSacramento, NombreSacramento, RequierePadrinos, EsDigitalizado)
+    SELECT
+        UPPER(LTRIM(RTRIM(REPLACE(p.Cod_Sacramento, CHAR(13), '')))),
+        LTRIM(RTRIM(REPLACE(p.Nombre_Sacramento, CHAR(13), ''))),
+        1,
+        CASE WHEN UPPER(LTRIM(RTRIM(REPLACE(p.Cod_Sacramento, CHAR(13), '')))) = 'CONF' THEN 0 ELSE 1 END
+    FROM staging.Programa p
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dw.Dim_TipoSacramento d
+        WHERE d.CodigoSacramento = UPPER(LTRIM(RTRIM(REPLACE(p.Cod_Sacramento, CHAR(13), ''))))
+    );
+
+    -- 3. Dim_Tiempo (1987-01-01 a 2025-12-31)
+    IF NOT EXISTS (SELECT 1 FROM dw.Dim_Tiempo)
+    BEGIN
+        SET DATEFIRST 7;
+        ;WITH FechasCTE AS (
+            SELECT CAST('1987-01-01' AS DATE) AS Fecha
+            UNION ALL
+            SELECT DATEADD(DAY, 1, Fecha)
+            FROM FechasCTE
+            WHERE Fecha < '2025-12-31'
+        )
+        INSERT INTO dw.Dim_Tiempo (
+            TiempoKey, Fecha, Anio, Semestre, Trimestre, Mes,
+            NombreMes, SemanaAnio, DiaSemana, NombreDia, EsFinDeSemana
+        )
+        SELECT
+            CONVERT(INT, FORMAT(Fecha, 'yyyyMMdd')),
+            Fecha,
+            YEAR(Fecha),
+            CASE WHEN MONTH(Fecha) <= 6 THEN 1 ELSE 2 END,
+            DATEPART(QUARTER, Fecha),
+            MONTH(Fecha),
+            CASE MONTH(Fecha)
+                WHEN 1 THEN 'Enero' WHEN 2 THEN 'Febrero' WHEN 3 THEN 'Marzo'
+                WHEN 4 THEN 'Abril' WHEN 5 THEN 'Mayo' WHEN 6 THEN 'Junio'
+                WHEN 7 THEN 'Julio' WHEN 8 THEN 'Agosto' WHEN 9 THEN 'Septiembre'
+                WHEN 10 THEN 'Octubre' WHEN 11 THEN 'Noviembre' WHEN 12 THEN 'Diciembre'
+            END,
+            DATEPART(WEEK, Fecha),
+            DATEPART(WEEKDAY, Fecha),
+            CASE DATEPART(WEEKDAY, Fecha)
+                WHEN 1 THEN 'Domingo' WHEN 2 THEN 'Lunes' WHEN 3 THEN 'Martes'
+                WHEN 4 THEN 'Miércoles' WHEN 5 THEN 'Jueves' WHEN 6 THEN 'Viernes'
+                WHEN 7 THEN 'Sábado'
+            END,
+            CASE WHEN DATEPART(WEEKDAY, Fecha) IN (1, 7) THEN 1 ELSE 0 END
+        FROM FechasCTE
+        OPTION (MAXRECURSION 0);
+    END
+
+    -- 4. Dim_Feligres (Anonimización irreversible SHA2_256 - Ley N.° 29733)
+    ;WITH PersonasRaw AS (
+        SELECT DISTINCT
+            UPPER(LTRIM(RTRIM(
+                ISNULL(Apellido_Paterno, 'NO REGISTRADO') + ' ' +
+                ISNULL(Apellido_Materno, '') + ' ' +
+                ISNULL(Nombres, '')
+            ))) AS IdentidadLimpia
+        FROM staging.Bautizos
+        UNION
+        SELECT DISTINCT
+            UPPER(LTRIM(RTRIM(
+                ISNULL(Ap_Pat_Esposo, 'NO REGISTRADO') + ' ' +
+                ISNULL(Ap_Mat_Esposo, '') + ' ' +
+                ISNULL(Nombres_Esposo, '')
+            )))
+        FROM staging.Matrimonios
+        UNION
+        SELECT DISTINCT
+            UPPER(LTRIM(RTRIM(
+                ISNULL(Ap_Pat_Esposa, 'NO REGISTRADO') + ' ' +
+                ISNULL(Ap_Mat_Esposa, '') + ' ' +
+                ISNULL(Nombres_Esposa, '')
+            )))
+        FROM staging.Matrimonios
+    ),
+    PersonasHash AS (
+        SELECT DISTINCT
+            CONVERT(CHAR(64), HASHBYTES('SHA2_256', IdentidadLimpia + '|BASAV_2026_2_PNSP'), 2) AS FeligresHash
+        FROM PersonasRaw
+    )
+    INSERT INTO dw.Dim_Feligres (FeligresHash)
+    SELECT ph.FeligresHash
+    FROM PersonasHash ph
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dw.Dim_Feligres df WHERE df.FeligresHash = ph.FeligresHash
+    );
+
+    -- 5. Dim_ConceptoFinanciero (Normalización de Ingresos y Categorización de Egresos)
+    ;WITH ConceptosIng AS (
+        SELECT DISTINCT
+            'INGRESO' AS TipoMovimiento,
+            CASE UPPER(LTRIM(RTRIM(ISNULL(DETALLE, 'NO REGISTRADO'))))
+                WHEN 'EFF' THEN 'EEF'
+                WHEN 'CANCIONERO' THEN 'CANCIONEROS'
+                ELSE UPPER(LTRIM(RTRIM(ISNULL(DETALLE, 'NO REGISTRADO'))))
+            END AS Categoria,
+            CASE UPPER(LTRIM(RTRIM(ISNULL(DETALLE, 'NO REGISTRADO'))))
+                WHEN 'EFF' THEN 'EEF'
+                WHEN 'CANCIONERO' THEN 'CANCIONEROS'
+                ELSE UPPER(LTRIM(RTRIM(ISNULL(DETALLE, 'NO REGISTRADO'))))
+            END AS DetalleEstandar,
+            CASE
+                WHEN UPPER(LTRIM(RTRIM(REPLACE(ISNULL(METODO, ''), CHAR(13), '')))) IN ('EFECTIVO', 'BANCO', 'YAPE', 'TRANSACCION')
+                    THEN UPPER(LTRIM(RTRIM(REPLACE(METODO, CHAR(13), ''))))
+                ELSE 'NO REGISTRADO'
+            END AS MedioPago
+        FROM staging.Ingresos
+    ),
+    ConceptosEgr AS (
+        SELECT DISTINCT
+            'EGRESO' AS TipoMovimiento,
+            CASE
+                WHEN DETALLE IS NULL OR LTRIM(RTRIM(DETALLE)) = '' THEN 'NO REGISTRADO'
+                WHEN UPPER(DETALLE) LIKE '%ASISTENTA%' OR UPPER(DETALLE) LIKE '%SECRETARIA%'
+                  OR UPPER(DETALLE) LIKE '%SACRISTANA%' OR UPPER(DETALLE) LIKE '%ADELANTO%'
+                  OR UPPER(DETALLE) LIKE '%CARMEN OR%' OR UPPER(DETALLE) LIKE '%CHAUPING%'
+                  OR UPPER(DETALLE) LIKE '%PAGO%' OR UPPER(DETALLE) LIKE '%LLENADO EXCEL%'
+                    THEN 'PERSONAL Y SERVICIOS'
+                WHEN UPPER(DETALLE) LIKE '%FLORES%' OR UPPER(DETALLE) LIKE '%CORO%'
+                  OR UPPER(DETALLE) LIKE '%VINO%' OR UPPER(DETALLE) LIKE '%HOSTIA%'
+                  OR UPPER(DETALLE) LIKE '%VELA%' OR UPPER(DETALLE) LIKE '%ALBA%'
+                  OR UPPER(DETALLE) LIKE '%MANTEL%' OR UPPER(DETALLE) LIKE '%LITURGIA%'
+                  OR UPPER(DETALLE) LIKE '%ACTA%' OR UPPER(DETALLE) LIKE '%CONSTANCIA%'
+                  OR UPPER(DETALLE) LIKE '%MISA%'
+                    THEN 'LITURGIA Y SACRAMENTOS'
+                WHEN UPPER(DETALLE) LIKE '%LIBRO%' OR UPPER(DETALLE) LIKE '%FOLLETO%'
+                  OR UPPER(DETALLE) LIKE '%CATECUMENADO%' OR UPPER(DETALLE) LIKE '%EEF%'
+                  OR UPPER(DETALLE) LIKE '%TALLER%' OR UPPER(DETALLE) LIKE '%SEMINARIO%'
+                  OR UPPER(DETALLE) LIKE '%CANCIONERO%'
+                    THEN 'PASTORAL Y FORMACION'
+                WHEN UPPER(DETALLE) LIKE '%DEVOLUCI%' THEN 'DEVOLUCIONES'
+                WHEN UPPER(DETALLE) LIKE '%PASAJE%' OR UPPER(DETALLE) LIKE '%MOVILIDAD%'
+                  OR UPPER(DETALLE) LIKE '%TAXI%' OR UPPER(DETALLE) LIKE '%GASOLINA%'
+                    THEN 'MOVILIDAD Y TRANSPORTE'
+                WHEN UPPER(DETALLE) LIKE '%LIMPIEZA%' OR UPPER(DETALLE) LIKE '%REGADO%'
+                  OR UPPER(DETALLE) LIKE '%PLANTA%' OR UPPER(DETALLE) LIKE '%LEJIA%'
+                  OR UPPER(DETALLE) LIKE '%PINO%' OR UPPER(DETALLE) LIKE '%DETERGENTE%'
+                  OR UPPER(DETALLE) LIKE '%GUANTE%' OR UPPER(DETALLE) LIKE '%PAPEL HIGI%'
+                  OR UPPER(DETALLE) LIKE '%FERRETERIA%' OR UPPER(DETALLE) LIKE '%LLAVE%'
+                    THEN 'MANTENIMIENTO Y LIMPIEZA'
+                WHEN UPPER(DETALLE) LIKE '%AGUA%' OR UPPER(DETALLE) LIKE '%GASEOSA%'
+                  OR UPPER(DETALLE) LIKE '%KEKE%' OR UPPER(DETALLE) LIKE '%ALMUERZO%'
+                  OR UPPER(DETALLE) LIKE '%COMIDA%' OR UPPER(DETALLE) LIKE '%VASO%'
+                    THEN 'ALIMENTOS Y REFRIGERIOS'
+                WHEN UPPER(DETALLE) LIKE '%PLUMON%' OR UPPER(DETALLE) LIKE '%CINTA%'
+                  OR UPPER(DETALLE) LIKE '%CHINCHE%' OR UPPER(DETALLE) LIKE '%FOSFORO%'
+                  OR UPPER(DETALLE) LIKE '%SOBRE%' OR UPPER(DETALLE) LIKE '%SELLO%'
+                    THEN 'UTILES DE OFICINA'
+                ELSE 'OTROS GASTOS OPERATIVOS'
+            END AS Categoria,
+            UPPER(LTRIM(RTRIM(ISNULL(DETALLE, 'NO REGISTRADO')))) AS DetalleEstandar,
+            'EFECTIVO' AS MedioPago
+        FROM staging.Egresos
+    ),
+    TodosConceptos AS (
+        SELECT * FROM ConceptosIng
+        UNION
+        SELECT * FROM ConceptosEgr
+    )
+    INSERT INTO dw.Dim_ConceptoFinanciero (TipoMovimiento, Categoria, DetalleEstandar, Procedencia, MedioPago)
+    SELECT tc.TipoMovimiento, tc.Categoria, tc.DetalleEstandar, 'Parroquial', tc.MedioPago
+    FROM TodosConceptos tc
+    WHERE NOT EXISTS (
+        SELECT 1 FROM dw.Dim_ConceptoFinanciero dc
+        WHERE dc.TipoMovimiento  = tc.TipoMovimiento
+          AND dc.Categoria       = tc.Categoria
+          AND dc.DetalleEstandar = tc.DetalleEstandar
+          AND dc.MedioPago       = tc.MedioPago
+    );
+END
+GO
+
+-- ============================================================================
+-- SP 2: CARGA DE HECHOS SACRAMENTALES (dw.Fact_Sacramento)
+-- ============================================================================
+CREATE OR ALTER PROCEDURE dw.usp_ETL_Cargar_Fact_Sacramento
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @UbicacionKey INT = (
+        SELECT TOP 1 UbicacionKey FROM dw.Dim_Ubicacion WHERE NombreSede = 'Parroquia Nuestra Señora de la Paz'
+    );
+
+    INSERT INTO staging.Cuarentena_Inconsistencias (TablaOrigen, TipoInconsistencia, DetalleError, DatosCrudos)
+    SELECT
+        'staging.Bautizos',
+        'ANIO_NULO_IMPUTADO',
+        'Acta de bautizo sin año; imputado al año modal del libro (2025)',
+        CONCAT('Libro=', Nro_Libro, ', Acta=', Nro_Acta, ', Folio=', Folio)
+    FROM staging.Bautizos
+    WHERE TRY_CAST(TRY_CAST(Anio AS FLOAT) AS INT) IS NULL;
+
+    INSERT INTO staging.Cuarentena_Inconsistencias (TablaOrigen, TipoInconsistencia, DetalleError, DatosCrudos)
+    SELECT
+        'staging.Matrimonios',
+        'ANIO_NULO_IMPUTADO',
+        'Acta de matrimonio sin año; imputado por continuidad cronológica (2012)',
+        CONCAT('Libro=', Nro_Libro, ', Acta=', Nro_Acta, ', Folio=', Folio)
+    FROM staging.Matrimonios
+    WHERE TRY_CAST(TRY_CAST(Anio AS FLOAT) AS INT) IS NULL;
+
+    TRUNCATE TABLE dw.Fact_Sacramento;
+
+    ;WITH SacramentosUnificados AS (
+        SELECT
+            TRY_CAST(TRY_CAST(Nro_Acta AS FLOAT) AS INT) AS NumeroActa,
+            TRY_CAST(TRY_CAST(Nro_Libro AS FLOAT) AS INT) AS NumeroLibro,
+            TRY_CAST(TRY_CAST(Folio AS FLOAT) AS INT) AS NumeroFolio,
+            UPPER(LTRIM(RTRIM(Cod_Sacramento))) AS CodigoSacramento,
+            ISNULL(TRY_CAST(TRY_CAST(Anio AS FLOAT) AS INT), 2025) AS AnioLimpio,
+            CONVERT(CHAR(64), HASHBYTES('SHA2_256',
+                UPPER(LTRIM(RTRIM(
+                    ISNULL(Apellido_Paterno, 'NO REGISTRADO') + ' ' +
+                    ISNULL(Apellido_Materno, '') + ' ' +
+                    ISNULL(Nombres, '')
+                ))) + '|BASAV_2026_2_PNSP'
+            ), 2) AS FeligresHash
+        FROM staging.Bautizos
+
+        UNION ALL
+
+        SELECT
+            TRY_CAST(TRY_CAST(Nro_Acta AS FLOAT) AS INT) AS NumeroActa,
+            TRY_CAST(TRY_CAST(Nro_Libro AS FLOAT) AS INT) AS NumeroLibro,
+            TRY_CAST(TRY_CAST(Folio AS FLOAT) AS INT) AS NumeroFolio,
+            UPPER(LTRIM(RTRIM(Cod_Sacramento))) AS CodigoSacramento,
+            ISNULL(TRY_CAST(TRY_CAST(Anio AS FLOAT) AS INT), 2012) AS AnioLimpio,
+            CONVERT(CHAR(64), HASHBYTES('SHA2_256',
+                UPPER(LTRIM(RTRIM(
+                    ISNULL(Ap_Pat_Esposo, 'NO REGISTRADO') + ' ' +
+                    ISNULL(Ap_Mat_Esposo, '') + ' ' +
+                    ISNULL(Nombres_Esposo, '')
+                ))) + '|BASAV_2026_2_PNSP'
+            ), 2) AS FeligresHash
+        FROM staging.Matrimonios
+    )
+    INSERT INTO dw.Fact_Sacramento (
+        TiempoKey, FeligresKey, TipoSacramentoKey, UbicacionKey,
+        NumeroLibro, NumeroFolio, NumeroActa, TiempoEmisionSeg, Cantidad
+    )
+    SELECT
+        (s.AnioLimpio * 10000) + 101 AS TiempoKey,
+        df.FeligresKey,
+        dt.TipoSacramentoKey,
+        @UbicacionKey,
+        s.NumeroLibro,
+        ISNULL(s.NumeroFolio, 0),
+        s.NumeroActa,
+        45,
+        1
+    FROM SacramentosUnificados s
+    INNER JOIN dw.Dim_Feligres df ON df.FeligresHash = s.FeligresHash
+    INNER JOIN dw.Dim_TipoSacramento dt ON dt.CodigoSacramento = s.CodigoSacramento;
+END
+GO
+
+-- ============================================================================
+-- SP 3: CARGA DE HECHOS FINANCIEROS (dw.Fact_Finanzas + Cuarentena)
+-- ============================================================================
+CREATE OR ALTER PROCEDURE dw.usp_ETL_Cargar_Fact_Finanzas
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET DATEFORMAT dmy;
+
+    DECLARE @UbicacionKey INT = (
+        SELECT TOP 1 UbicacionKey FROM dw.Dim_Ubicacion WHERE NombreSede = 'Parroquia Nuestra Señora de la Paz'
+    );
+
+    INSERT INTO staging.Cuarentena_Inconsistencias (TablaOrigen, TipoInconsistencia, DetalleError, DatosCrudos)
+    SELECT
+        'staging.Ingresos',
+        'FECHA_FUERA_DE_EJERCICIO',
+        'Fecha en año 2026 corregida al ejercicio fiscal 2025',
+        CONCAT('Recibo=', ISNULL(RECIBO,'SIN_RECIBO'), ', Fecha=', FECHA, ', Detalle=', DETALLE, ', Aporte=', APORTE)
+    FROM staging.Ingresos
+    WHERE YEAR(TRY_CAST(LTRIM(RTRIM(FECHA)) AS DATE)) = 2026;
+
+    INSERT INTO staging.Cuarentena_Inconsistencias (TablaOrigen, TipoInconsistencia, DetalleError, DatosCrudos)
+    SELECT
+        'staging.Ingresos',
+        'METODO_PAGO_INVALIDO',
+        CONCAT('Método no reconocido (', ISNULL(REPLACE(METODO, CHAR(13), ''),'NULL'), ') imputado a NO REGISTRADO'),
+        CONCAT('Recibo=', ISNULL(RECIBO,'SIN_RECIBO'), ', Fecha=', FECHA, ', Detalle=', DETALLE, ', Aporte=', APORTE)
+    FROM staging.Ingresos
+    WHERE UPPER(LTRIM(RTRIM(REPLACE(ISNULL(METODO,''), CHAR(13), '')))) NOT IN ('EFECTIVO', 'BANCO', 'YAPE', 'TRANSACCION');
+
+    INSERT INTO staging.Cuarentena_Inconsistencias (TablaOrigen, TipoInconsistencia, DetalleError, DatosCrudos)
+    SELECT
+        'staging.Egresos',
+        'DESCRIPCION_NULA',
+        'Egreso sin descripción imputado a NO REGISTRADO',
+        CONCAT('Fecha=', FECHA, ', Monto=', REPLACE(MONTO, CHAR(13), ''))
+    FROM staging.Egresos
+    WHERE DETALLE IS NULL OR LTRIM(RTRIM(DETALLE)) = '';
+
+    TRUNCATE TABLE dw.Fact_Finanzas;
+
+    INSERT INTO dw.Fact_Finanzas (
+        TiempoKey, ConceptoKey, UbicacionKey, NumeroComprobante,
+        MontoIngreso, MontoEgreso, CantidadOperaciones
+    )
+    SELECT
+        CONVERT(INT, FORMAT(
+            CASE
+                WHEN YEAR(TRY_CAST(LTRIM(RTRIM(i.FECHA)) AS DATE)) = 2026
+                    THEN DATEFROMPARTS(2025, MONTH(TRY_CAST(LTRIM(RTRIM(i.FECHA)) AS DATE)), DAY(TRY_CAST(LTRIM(RTRIM(i.FECHA)) AS DATE)))
+                ELSE TRY_CAST(LTRIM(RTRIM(i.FECHA)) AS DATE)
+            END, 'yyyyMMdd'
+        )) AS TiempoKey,
+        dc.ConceptoKey,
+        @UbicacionKey,
+        ISNULL(NULLIF(LTRIM(RTRIM(i.RECIBO)), ''), 'SIN_RECIBO'),
+        TRY_CAST(LTRIM(RTRIM(REPLACE(i.APORTE, CHAR(13), ''))) AS DECIMAL(12,2)),
+        0.00,
+        1
+    FROM staging.Ingresos i
+    INNER JOIN dw.Dim_ConceptoFinanciero dc
+        ON dc.TipoMovimiento = 'INGRESO'
+       AND dc.DetalleEstandar = CASE UPPER(LTRIM(RTRIM(ISNULL(i.DETALLE, 'NO REGISTRADO'))))
+                                    WHEN 'EFF' THEN 'EEF'
+                                    WHEN 'CANCIONERO' THEN 'CANCIONEROS'
+                                    ELSE UPPER(LTRIM(RTRIM(ISNULL(i.DETALLE, 'NO REGISTRADO'))))
+                                END
+       AND dc.MedioPago = CASE
+                              WHEN UPPER(LTRIM(RTRIM(REPLACE(ISNULL(i.METODO, ''), CHAR(13), '')))) IN ('EFECTIVO', 'BANCO', 'YAPE', 'TRANSACCION')
+                                  THEN UPPER(LTRIM(RTRIM(REPLACE(i.METODO, CHAR(13), ''))))
+                              ELSE 'NO REGISTRADO'
+                          END
+    WHERE TRY_CAST(LTRIM(RTRIM(REPLACE(i.APORTE, CHAR(13), ''))) AS DECIMAL(12,2)) > 0;
+
+    INSERT INTO dw.Fact_Finanzas (
+        TiempoKey, ConceptoKey, UbicacionKey, NumeroComprobante,
+        MontoIngreso, MontoEgreso, CantidadOperaciones
+    )
+    SELECT
+        CONVERT(INT, FORMAT(TRY_CAST(LTRIM(RTRIM(e.FECHA)) AS DATE), 'yyyyMMdd')) AS TiempoKey,
+        dc.ConceptoKey,
+        @UbicacionKey,
+        'NO_APLICA',
+        0.00,
+        TRY_CAST(LTRIM(RTRIM(REPLACE(e.MONTO, CHAR(13), ''))) AS DECIMAL(12,2)),
+        1
+    FROM staging.Egresos e
+    INNER JOIN dw.Dim_ConceptoFinanciero dc
+        ON dc.TipoMovimiento = 'EGRESO'
+       AND dc.DetalleEstandar = UPPER(LTRIM(RTRIM(ISNULL(e.DETALLE, 'NO REGISTRADO'))))
+    WHERE TRY_CAST(LTRIM(RTRIM(REPLACE(e.MONTO, CHAR(13), ''))) AS DECIMAL(12,2)) > 0;
+END
+GO
+
+-- ============================================================================
+-- SP 4: ORQUESTADOR PRINCIPAL
+-- ============================================================================
+CREATE OR ALTER PROCEDURE dw.usp_Orquestador_ETL_Principal
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Inicio DATETIME = GETDATE();
+    DECLARE @LogID INT;
+
+    INSERT INTO dw.Log_Ejecucion_ETL (Proceso, FechaInicio, Estado)
+    VALUES ('usp_Orquestador_ETL_Principal', @Inicio, 'EN_EJECUCION');
+    SET @LogID = SCOPE_IDENTITY();
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        TRUNCATE TABLE staging.Cuarentena_Inconsistencias;
+
+        EXEC dw.usp_ETL_Cargar_Dimensiones;
+        EXEC dw.usp_ETL_Cargar_Fact_Sacramento;
+        EXEC dw.usp_ETL_Cargar_Fact_Finanzas;
+
+        COMMIT TRANSACTION;
+
+        DECLARE @TotalFilas INT = (
+            SELECT (SELECT COUNT(*) FROM dw.Fact_Sacramento) + (SELECT COUNT(*) FROM dw.Fact_Finanzas)
+        );
+
+        UPDATE dw.Log_Ejecucion_ETL
+        SET FechaFin        = GETDATE(),
+            DuracionMs      = DATEDIFF(MILLISECOND, @Inicio, GETDATE()),
+            FilasInsertadas = @TotalFilas,
+            Estado          = 'EXITOSO'
+        WHERE LogID = @LogID;
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+
+        UPDATE dw.Log_Ejecucion_ETL
+        SET FechaFin     = GETDATE(),
+            DuracionMs   = DATEDIFF(MILLISECOND, @Inicio, GETDATE()),
+            Estado       = 'ERROR',
+            MensajeError = ERROR_MESSAGE()
+        WHERE LogID = @LogID;
+
+        THROW;
+    END CATCH
+END
+GO
