@@ -1,69 +1,70 @@
 # Proyecto Final: Solución BI y Big Data - Parroquia Nuestra Señora de la Paz
 
-Repositorio del proyecto final para el curso de **Base de Datos Avanzadas y Big Data (NRC 19562)** de la **Universidad Privada del Norte (UPN)** – Ciclo 2026-2.
+Repositorio oficial del proyecto final para el curso de **Base de Datos Avanzadas y Big Data (NRC 19562)** de la **Universidad Privada del Norte (UPN)** – Período 2026-2.
 
 ## ¿De qué trata el proyecto?
-En este proyecto desarrollamos una solución de Inteligencia de Negocios (BI) y Big Data para ayudar a la **Parroquia Nuestra Señora de la Paz** a centralizar sus registros de sacramentos (bautizos, matrimonios, etc.) y sus ingresos y egresos. Antes todo se hacía de forma manual en libros y hojas de Excel, lo que tomaba mucho tiempo; con este sistema automatizamos la carga de datos, protegemos la identidad de los feligreses (según la Ley N.° 29733) y mostramos los resultados en un dashboard interactivo.
+En este proyecto desarrollamos una solución integrada de Inteligencia de Negocios (BI) y Big Data para ayudar a la **Parroquia Nuestra Señora de la Paz** a centralizar sus registros sacramentales (1987–2025) y su balance financiero. Antes los procesos se realizaban manualmente en libros físicos y hojas de Excel, lo que demandaba hasta 8 horas para consolidar el balance mensual. Con esta solución automatizamos la carga de datos, protegemos la identidad de los feligreses (según la Ley N.° 29733) y mostramos los indicadores clave en un tablero interactivo.
 
-## Archivos del Repositorio
+## Estructura del Repositorio
 
 ```text
 BASAV_2026-2_ProyectoParroquia/
-├── Almacén de datos.sql                # Script para crear la base de datos y los esquemas (staging y dw)
-├── Parroquia_DW                        # Script para crear las tablas de dimensiones, hechos e índices
-├── _Crear_Insertar_Ingresos_Egresos    # Script para cargar los datos de ingresos y egresos del balance
-├── Cargar_Staging_Sacramentos          # Script para traer los datos de bautizos y matrimonios a staging
-├── Procedimientos almacenados_ETL      # Procedimientos para limpiar datos, encriptar DNI y cargar el DW
-├── Ejecucion_y_Validacion              # Consultas para comprobar que los montos cuadren y revisar errores
-├── Pruebas_Experimento_Cap4            # Consultas para medir los tiempos de respuesta del experimento
-└── README.md                           # Guía paso a paso para ejecutar el proyecto
+├── Almacén de datos.sql                # Script para crear la BD BD_DW_Parroquia y esquemas (staging, dw)
+├── Parroquia_DW                        # Script para crear dimensiones, tablas de hechos e índices
+├── _Crear_Insertar_Ingresos_Egresos    # Script para cargar los ingresos y egresos (Balance 2025)
+├── Cargar_Staging_Sacramentos          # Script para extraer las actas desde Constancias_Parroquia
+├── Procedimientos almacenados_ETL      # Procedimientos de limpieza, encriptación SHA-256 y carga
+├── Ejecucion_y_Validacion              # Consultas para comprobar cuadre de montos y cuarentena
+├── Pruebas_Experimento_Cap4            # Consultas para medir tiempos y rendimiento (Cap. IV)
+├── Parroquia_EF.pbix                   # Dashboard interactivo en Power BI con medidas DAX y RLS
+└── README.md                           # Guía paso a paso para reproducir el proyecto
 ```
 
 ## Programas necesarios
-Para correr este proyecto en otra computadora se necesita tener instalado:
+Para ejecutar y reproducir este proyecto se requiere tener instalado:
 * **Microsoft SQL Server 2022** (Developer Edition) y **SSMS** (SQL Server Management Studio).
-* **Microsoft Power BI Desktop** (para abrir el tablero de gráficos).
+* **Microsoft Power BI Desktop** (Versión 2026).
 * **Google Colab** o **Databricks** con Python y la librería `pyspark` (para la parte de Big Data).
 
 ---
 
-## Paso 1: Cómo ejecutar la Solución BI (SQL Server y Power BI)
+## Paso 1: Cómo reproducir la Solución BI (SQL Server y Power BI)
 
-Abrir **SSMS** y ejecutar los scripts en este orden:
+Abrir **SSMS** y ejecutar los scripts en el siguiente orden:
 
-1. **Crear la base de datos y las tablas:**
-   * Primero correr el archivo `Almacén de datos.sql` para crear la base `BD_DW_Parroquia` con sus esquemas `staging` y `dw`.
-   * Luego correr `Parroquia_DW` para crear todas las tablas de dimensiones y tablas de hechos.
-2. **Cargar los datos iniciales (Staging):**
-   * Restaurar la base de datos original `Constancias_Parroquia` y ejecutar `Cargar_Staging_Sacramentos` para pasar los 15,575 registros de sacramentos.
-   * Ejecutar `_Crear_Insertar_Ingresos_Egresos` para insertar los 2,952 registros del balance económico.
-3. **Limpiar y pasar los datos al Data Warehouse (ETL):**
-   * Ejecutar el archivo `Procedimientos almacenados_ETL` para guardar los procedimientos en la base de datos.
-   * Correr el procedimiento principal con el siguiente comando:
+1. **Crear la base de datos y el modelo dimensional:**
+   * Ejecutar `Almacén de datos.sql` para crear la base `BD_DW_Parroquia` y los esquemas `staging` y `dw`.
+   * Ejecutar `Parroquia_DW` para crear las 5 dimensiones, las 2 tablas de hechos (`Fact_Sacramento` y `Fact_Finanzas`) y los índices *non-clustered*.
+2. **Cargar los datos iniciales en Staging:**
+   * Restaurar la base origen `Constancias_Parroquia` y ejecutar `Cargar_Staging_Sacramentos` (15,575 actas).
+   * Ejecutar `_Crear_Insertar_Ingresos_Egresos` para insertar los movimientos contables (2,952 registros del Balance 2025).
+3. **Ejecutar el proceso ETL y anonimización:**
+   * Ejecutar `Procedimientos almacenados_ETL` para crear los procedimientos modulares y el orquestador maestro.
+   * Correr el flujo completo ejecutando:
      ```sql
      EXEC dw.usp_Orquestador_ETL_Principal;
      ```
-   * *(Opcional)* Se puede programar el Job `JOB_ETL_PARROQUIA_DIARIO` en el Agente de SQL Server para que corra solo todos los días a las 2:00 AM.
-4. **Revisar validación y abrir Power BI:**
-   * Ejecutar `Ejecucion_y_Validacion` para verificar que la suma de ingresos y egresos cuadre al 100% y ver los 29 registros con errores que se separaron en la tabla de cuarentena.
-   * Abrir el archivo `.pbix` en Power BI Desktop, actualizar la conexión hacia su servidor local de SQL Server y probar los filtros y roles (Secretaría y Párroco).
+   * *(Opcional)* Configurar el Job `JOB_ETL_PARROQUIA_DIARIO` en SQL Server Agent para ejecución diaria a las 02:00 AM.
+4. **Validar resultados y abrir el Dashboard:**
+   * Ejecutar `Ejecucion_y_Validacion` para comprobar el cuadre financiero al 100 % y verificar los 29 registros con inconsistencias aislados en `staging.Cuarentena_Inconsistencias`.
+   * Descargar y abrir **`Parroquia_EF.pbix`** en Power BI Desktop, actualizar la conexión hacia su servidor local de SQL Server (`BD_DW_Parroquia`) y probar los filtros dinámicos y roles RLS (`Secretaría` y `Párroco`).
 
 ---
 
 ## Paso 2: Cómo reproducir el Experimento (Capítulo IV)
 
-Para volver a tomar los tiempos que pusimos en las tablas del Capítulo IV y VI:
-1. Tener ya cargadas las tablas en `staging` y `dw` dentro de SQL Server.
+Para replicar las mediciones de rendimiento documentadas en los Capítulos IV y VI:
+1. Verificar que las tablas de `staging` y `dw` estén cargadas en `BD_DW_Parroquia`.
 2. Abrir el archivo `Pruebas_Experimento_Cap4` en SSMS.
-3. Activar la medición de tiempos y lecturas con `SET STATISTICS TIME ON;` y `SET STATISTICS IO ON;` (y limpiar la memoria caché con `DBCC DROPCLEANBUFFERS;` antes de cada prueba).
-4. Ejecutar las consultas comparando cuánto demora la consulta en las tablas planas (`staging`) frente al modelo estrella con índices (`dw`), además del tiempo total del procedimiento ETL (`1.49 segundos`).
+3. Activar las estadísticas de tiempo y lecturas lógicas (`SET STATISTICS TIME ON; SET STATISTICS IO ON;`) y limpiar la memoria caché (`DBCC DROPCLEANBUFFERS;`) antes de cada prueba.
+4. Ejecutar los escenarios comparativos midiendo el tiempo del orquestador ETL (`1.49 segundos`) y la latencia de consultas entre tablas planas (`staging`) frente al modelo dimensional indexado (`dw`).
 
----
 
-## Nota sobre privacidad y autores
-* **Privacidad:** Por respeto a la Ley N.° 29733 de Protección de Datos Personales, todos los nombres y DNI reales de los feligreses fueron encriptados con `SHA2_256` antes de pasar al Data Warehouse. Los datos se usan solo para fines académicos con permiso del Párroco.
-* **Integrantes del grupo:**
+
+## Privacidad y Autores
+* **Protección de Datos (Ley N.° 29733):** Todos los nombres y DNI reales fueron enmascarados irreversiblemente mediante `HASHBYTES('SHA2_256')` antes de su carga analítica. Uso estrictamente académico con autorización firmada del Párroco.
+* **Equipo del proyecto:**
   * Espinoza Carranza, Albert Jose
-  * Huamán Solís, Luis Felipe
   * Gutiérrez Trillo, Brayan Esteban
+  * Huamán Solís, Luis Felipe
   * Rojas López, Xiomara Nicole
