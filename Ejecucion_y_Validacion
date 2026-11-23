@@ -1,0 +1,40 @@
+-- ============================================================================
+-- ARCHIVO: 04_Ejecucion_y_Validacion.sql
+-- PROYECTO: BASAV 2026-2 - Parroquia Nuestra Señora de la Paz
+-- DESCRIPCIÓN: Ejecución del orquestador ETL, auditoría de cuarentena,
+--              conteos del Data Mart y reconciliación financiera (E-06).
+-- ============================================================================
+USE BD_DW_Parroquia;
+GO
+
+EXEC dw.usp_Orquestador_ETL_Principal;
+GO
+
+-- 1. Log de Ejecución ETL
+SELECT * FROM dw.Log_Ejecucion_ETL;
+
+-- 2. Auditoría de Cuarentena
+SELECT TablaOrigen, TipoInconsistencia, COUNT(*) AS Cantidad
+FROM staging.Cuarentena_Inconsistencias
+GROUP BY TablaOrigen, TipoInconsistencia;
+
+-- 3. Conteos de Dimensiones y Hechos
+SELECT 'Dim_Tiempo'             AS Tabla, COUNT(*) AS Filas FROM dw.Dim_Tiempo             UNION ALL
+SELECT 'Dim_Feligres'           AS Tabla, COUNT(*) AS Filas FROM dw.Dim_Feligres           UNION ALL
+SELECT 'Dim_TipoSacramento'     AS Tabla, COUNT(*) AS Filas FROM dw.Dim_TipoSacramento     UNION ALL
+SELECT 'Dim_ConceptoFinanciero' AS Tabla, COUNT(*) AS Filas FROM dw.Dim_ConceptoFinanciero UNION ALL
+SELECT 'Dim_Ubicacion'          AS Tabla, COUNT(*) AS Filas FROM dw.Dim_Ubicacion          UNION ALL
+SELECT 'Fact_Sacramento'        AS Tabla, COUNT(*) AS Filas FROM dw.Fact_Sacramento        UNION ALL
+SELECT 'Fact_Finanzas'          AS Tabla, COUNT(*) AS Filas FROM dw.Fact_Finanzas;
+
+-- 4. Reconciliación Financiera (Staging vs Data Warehouse)
+SELECT
+    (SELECT SUM(TRY_CAST(REPLACE(APORTE, CHAR(13), '') AS DECIMAL(12,2))) FROM staging.Ingresos) AS Ingresos_Staging,
+    (SELECT SUM(MontoIngreso) FROM dw.Fact_Finanzas)                                             AS Ingresos_DW,
+    (SELECT SUM(TRY_CAST(REPLACE(MONTO, CHAR(13), '') AS DECIMAL(12,2))) FROM staging.Egresos)   AS Egresos_Staging,
+    (SELECT SUM(MontoEgreso) FROM dw.Fact_Finanzas)                                              AS Egresos_DW,
+    (SELECT SUM(MargenNeto) FROM dw.Fact_Finanzas)                                               AS Margen_Neto_DW;
+
+-- 5. Muestra de Anonimización SHA-256 (Ley N.° 29733)
+SELECT TOP 10 FeligresKey, FeligresHash FROM dw.Dim_Feligres;
+GO
