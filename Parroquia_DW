@@ -1,0 +1,185 @@
+-- ============================================================================
+-- ARCHIVO: 01_DDL_Parroquia_DW.sql
+-- PROYECTO: BASAV 2026-2 - Parroquia Nuestra Señora de la Paz
+-- DESCRIPCIÓN: Creación de la base de datos BD_DW_Parroquia, esquemas (staging, dw),
+--              tablas de aterrizaje, dimensiones, tablas de hechos, cuarentena,
+--              log de auditoría e índices non-clustered.
+-- ============================================================================
+USE master;
+GO
+
+IF DB_ID('BD_DW_Parroquia') IS NOT NULL
+BEGIN
+    ALTER DATABASE BD_DW_Parroquia SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+    DROP DATABASE BD_DW_Parroquia;
+END
+GO
+
+CREATE DATABASE BD_DW_Parroquia;
+GO
+
+USE BD_DW_Parroquia;
+GO
+
+CREATE SCHEMA staging;
+GO
+CREATE SCHEMA dw;
+GO
+
+-- ============================================================================
+-- 1. CAPA STAGING (Tablas permisivas en NVARCHAR para aterrizaje sin rechazos)
+-- ============================================================================
+CREATE TABLE staging.Programa (
+    Cod_Sacramento      NVARCHAR(50),
+    Nombre_Sacramento   NVARCHAR(100)
+);
+
+CREATE TABLE staging.Libro (
+    Nro_Libro           NVARCHAR(50),
+    Cod_Sacramento      NVARCHAR(50)
+);
+
+CREATE TABLE staging.Bautizos (
+    Nro_Acta            NVARCHAR(50),
+    Nro_Libro           NVARCHAR(50),
+    Cod_Sacramento      NVARCHAR(50),
+    Apellido_Paterno    NVARCHAR(150),
+    Apellido_Materno    NVARCHAR(150),
+    Nombres             NVARCHAR(150),
+    Anio                NVARCHAR(50),
+    Folio               NVARCHAR(50)
+);
+
+CREATE TABLE staging.Matrimonios (
+    Nro_Acta            NVARCHAR(50),
+    Nro_Libro           NVARCHAR(50),
+    Cod_Sacramento      NVARCHAR(50),
+    Ap_Pat_Esposo       NVARCHAR(150),
+    Ap_Mat_Esposo       NVARCHAR(150),
+    Nombres_Esposo      NVARCHAR(150),
+    Ap_Pat_Esposa       NVARCHAR(150),
+    Ap_Mat_Esposa       NVARCHAR(150),
+    Nombres_Esposa      NVARCHAR(150),
+    Anio                NVARCHAR(50),
+    Folio               NVARCHAR(50)
+);
+
+CREATE TABLE staging.Ingresos (
+    RECIBO              NVARCHAR(100),
+    FECHA               NVARCHAR(50),
+    DETALLE             NVARCHAR(200),
+    APORTE              NVARCHAR(50),
+    METODO              NVARCHAR(50)
+);
+
+CREATE TABLE staging.Egresos (
+    FECHA               NVARCHAR(50),
+    DETALLE             NVARCHAR(250),
+    MONTO               NVARCHAR(50)
+);
+
+CREATE TABLE staging.Cuarentena_Inconsistencias (
+    CuarentenaID        INT IDENTITY(1,1) PRIMARY KEY,
+    FechaRegistro       DATETIME DEFAULT GETDATE(),
+    TablaOrigen         VARCHAR(60) NOT NULL,
+    TipoInconsistencia  VARCHAR(80) NOT NULL,
+    DetalleError        VARCHAR(300) NOT NULL,
+    DatosCrudos         NVARCHAR(MAX) NULL
+);
+GO
+
+-- ============================================================================
+-- 2. CAPA DATA WAREHOUSE (Modelo Dimensional - Constelación de Hechos)
+-- ============================================================================
+CREATE TABLE dw.Dim_Tiempo (
+    TiempoKey           INT PRIMARY KEY,          -- Formato YYYYMMDD
+    Fecha               DATE NOT NULL,
+    Anio                SMALLINT NOT NULL,
+    Semestre            TINYINT NOT NULL,
+    Trimestre           TINYINT NOT NULL,
+    Mes                 TINYINT NOT NULL,
+    NombreMes           VARCHAR(15) NOT NULL,
+    SemanaAnio          TINYINT NOT NULL,
+    DiaSemana           TINYINT NOT NULL,
+    NombreDia           VARCHAR(15) NOT NULL,
+    EsFinDeSemana       BIT NOT NULL
+);
+
+CREATE TABLE dw.Dim_Feligres (
+    FeligresKey         INT IDENTITY(1,1) PRIMARY KEY,
+    FeligresHash        CHAR(64) NOT NULL UNIQUE, -- SHA-256 (Ley N.° 29733)
+    Genero              CHAR(1) NULL DEFAULT 'N',
+    RangoEtario         VARCHAR(25) NULL DEFAULT 'NO ESPECIFICADO',
+    DistritoResidencia  VARCHAR(80) NULL DEFAULT 'SAN JUAN DE LURIGANCHO',
+    EsPadrino           BIT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE dw.Dim_TipoSacramento (
+    TipoSacramentoKey   INT IDENTITY(1,1) PRIMARY KEY,
+    CodigoSacramento    VARCHAR(10) NOT NULL UNIQUE,
+    NombreSacramento    VARCHAR(50) NOT NULL,
+    RequierePadrinos    BIT NOT NULL DEFAULT 1,
+    EsDigitalizado      BIT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE dw.Dim_ConceptoFinanciero (
+    ConceptoKey         INT IDENTITY(1,1) PRIMARY KEY,
+    TipoMovimiento      VARCHAR(10) NOT NULL,     -- 'INGRESO' o 'EGRESO'
+    Categoria           VARCHAR(50) NOT NULL,
+    DetalleEstandar     VARCHAR(150) NOT NULL,
+    Procedencia         VARCHAR(20) NOT NULL DEFAULT 'Parroquial',
+    MedioPago           VARCHAR(30) NOT NULL,
+    CONSTRAINT UQ_Dim_Concepto UNIQUE (TipoMovimiento, Categoria, DetalleEstandar, MedioPago)
+);
+
+CREATE TABLE dw.Dim_Ubicacion (
+    UbicacionKey        INT IDENTITY(1,1) PRIMARY KEY,
+    NombreSede          VARCHAR(100) NOT NULL UNIQUE,
+    TipoSede            VARCHAR(30) NOT NULL,
+    Zona                VARCHAR(50) NULL
+);
+
+CREATE TABLE dw.Fact_Sacramento (
+    SacramentoKey       BIGINT IDENTITY(1,1) PRIMARY KEY,
+    TiempoKey           INT NOT NULL FOREIGN KEY REFERENCES dw.Dim_Tiempo(TiempoKey),
+    FeligresKey         INT NOT NULL FOREIGN KEY REFERENCES dw.Dim_Feligres(FeligresKey),
+    TipoSacramentoKey   INT NOT NULL FOREIGN KEY REFERENCES dw.Dim_TipoSacramento(TipoSacramentoKey),
+    UbicacionKey        INT NOT NULL FOREIGN KEY REFERENCES dw.Dim_Ubicacion(UbicacionKey),
+    NumeroLibro         INT NULL,
+    NumeroFolio         INT NULL,
+    NumeroActa          INT NULL,
+    TiempoEmisionSeg    INT NOT NULL DEFAULT 45,
+    Cantidad            INT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE dw.Fact_Finanzas (
+    FinanzasKey         BIGINT IDENTITY(1,1) PRIMARY KEY,
+    TiempoKey           INT NOT NULL FOREIGN KEY REFERENCES dw.Dim_Tiempo(TiempoKey),
+    ConceptoKey         INT NOT NULL FOREIGN KEY REFERENCES dw.Dim_ConceptoFinanciero(ConceptoKey),
+    UbicacionKey        INT NOT NULL FOREIGN KEY REFERENCES dw.Dim_Ubicacion(UbicacionKey),
+    NumeroComprobante   VARCHAR(30) NULL,
+    MontoIngreso        DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    MontoEgreso         DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    MargenNeto          AS (MontoIngreso - MontoEgreso) PERSISTED,
+    CantidadOperaciones INT NOT NULL DEFAULT 1
+);
+
+CREATE TABLE dw.Log_Ejecucion_ETL (
+    LogID               INT IDENTITY(1,1) PRIMARY KEY,
+    Proceso             VARCHAR(100) NOT NULL,
+    FechaInicio         DATETIME NOT NULL,
+    FechaFin            DATETIME NULL,
+    DuracionMs          INT NULL,
+    FilasInsertadas     INT NULL,
+    Estado              VARCHAR(20) NOT NULL,
+    MensajeError        NVARCHAR(MAX) NULL
+);
+GO
+
+-- Índices Non-Clustered para optimizar consultas OLAP y Power BI
+CREATE NONCLUSTERED INDEX IX_FactSac_Tiempo ON dw.Fact_Sacramento(TiempoKey);
+CREATE NONCLUSTERED INDEX IX_FactSac_Tipo   ON dw.Fact_Sacramento(TipoSacramentoKey);
+CREATE NONCLUSTERED INDEX IX_FactSac_Fel    ON dw.Fact_Sacramento(FeligresKey);
+CREATE NONCLUSTERED INDEX IX_FactFin_Tiempo ON dw.Fact_Finanzas(TiempoKey);
+CREATE NONCLUSTERED INDEX IX_FactFin_Conc   ON dw.Fact_Finanzas(ConceptoKey);
+GO
