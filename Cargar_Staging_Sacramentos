@@ -1,0 +1,43 @@
+-- ============================================================================
+-- ARCHIVO: 02B_Cargar_Staging_Sacramentos.sql
+-- PROYECTO: BASAV 2026-2 - Parroquia Nuestra Señora de la Paz
+-- DESCRIPCIÓN: Extracción de las 4 tablas sacramentales desde la BD fuente
+--              restaurada (Constancias_Parroquia) hacia BD_DW_Parroquia.staging.
+-- ============================================================================
+USE BD_DW_Parroquia;
+GO
+
+TRUNCATE TABLE staging.Programa;
+TRUNCATE TABLE staging.Libro;
+TRUNCATE TABLE staging.Bautizos;
+TRUNCATE TABLE staging.Matrimonios;
+GO
+
+INSERT INTO staging.Programa (Cod_Sacramento, Nombre_Sacramento)
+SELECT * FROM Constancias_Parroquia.dbo.Programa;
+
+INSERT INTO staging.Libro (Nro_Libro, Cod_Sacramento)
+SELECT * FROM Constancias_Parroquia.dbo.Libro;
+
+INSERT INTO staging.Bautizos (
+    Nro_Acta, Nro_Libro, Cod_Sacramento,
+    Apellido_Paterno, Apellido_Materno, Nombres, Anio, Folio
+)
+SELECT * FROM Constancias_Parroquia.dbo.ConstanciaBautizo;
+
+INSERT INTO staging.Matrimonios (
+    Nro_Acta, Nro_Libro, Cod_Sacramento,
+    Ap_Pat_Esposo, Ap_Mat_Esposo, Nombres_Esposo,
+    Ap_Pat_Esposa, Ap_Mat_Esposa, Nombres_Esposa, Anio, Folio
+)
+SELECT * FROM Constancias_Parroquia.dbo.ConstanciaMatrimonio;
+GO
+
+-- Verificación de conteos en staging
+SELECT 'staging.Programa'    AS Tabla, COUNT(*) AS Filas FROM staging.Programa    UNION ALL
+SELECT 'staging.Libro'       AS Tabla, COUNT(*) AS Filas FROM staging.Libro       UNION ALL
+SELECT 'staging.Bautizos'    AS Tabla, COUNT(*) AS Filas FROM staging.Bautizos    UNION ALL
+SELECT 'staging.Matrimonios' AS Tabla, COUNT(*) AS Filas FROM staging.Matrimonios UNION ALL
+SELECT 'staging.Ingresos'    AS Tabla, COUNT(*) AS Filas FROM staging.Ingresos    UNION ALL
+SELECT 'staging.Egresos'     AS Tabla, COUNT(*) AS Filas FROM staging.Egresos;
+GO
