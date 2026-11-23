@@ -1,0 +1,55 @@
+-- ============================================================================
+-- ARCHIVO: 05_Pruebas_Experimento_Cap4.sql
+-- PROYECTO: BASAV 2026-2 - Parroquia Nuestra Señora de la Paz
+-- DESCRIPCIÓN: Consultas analíticas OLAP y benchmark en frío (Cold Start)
+--              para evaluación experimental (EXP-01, EXP-02 y EXP-03).
+-- ============================================================================
+USE BD_DW_Parroquia;
+GO
+
+CHECKPOINT;
+DBCC DROPCLEANBUFFERS;
+DBCC FREEPROCCACHE;
+GO
+
+SET STATISTICS TIME ON;
+SET STATISTICS IO ON;
+
+-- Q1: Agregación sacramental histórica por Año, Tipo y Libro
+SELECT t.Anio, ts.NombreSacramento, f.NumeroLibro, COUNT(*) AS Total_Actas
+FROM dw.Fact_Sacramento f
+JOIN dw.Dim_Tiempo t ON f.TiempoKey = t.TiempoKey
+JOIN dw.Dim_TipoSacramento ts ON f.TipoSacramentoKey = ts.TipoSacramentoKey
+GROUP BY t.Anio, ts.NombreSacramento, f.NumeroLibro
+ORDER BY t.Anio DESC;
+
+-- Q2: Balance financiero consolidado mensual y margen neto (KPI-06)
+SELECT t.Anio, t.Mes, t.NombreMes, c.MedioPago,
+       SUM(f.MontoIngreso) AS Total_Ingresos,
+       SUM(f.MontoEgreso)  AS Total_Egresos,
+       SUM(f.MargenNeto)   AS Margen_Neto
+FROM dw.Fact_Finanzas f
+JOIN dw.Dim_Tiempo t ON f.TiempoKey = t.TiempoKey
+JOIN dw.Dim_ConceptoFinanciero c ON f.ConceptoKey = c.ConceptoKey
+GROUP BY t.Anio, t.Mes, t.NombreMes, c.MedioPago
+ORDER BY t.Mes;
+
+-- Q3: Ranking de conceptos de ingreso y categorías de egreso
+SELECT c.TipoMovimiento, c.Categoria, COUNT(*) AS Operaciones,
+       SUM(f.MontoIngreso) AS Ingresos, SUM(f.MontoEgreso) AS Egresos
+FROM dw.Fact_Finanzas f
+JOIN dw.Dim_ConceptoFinanciero c ON f.ConceptoKey = c.ConceptoKey
+GROUP BY c.TipoMovimiento, c.Categoria
+ORDER BY c.TipoMovimiento, Ingresos DESC, Egresos DESC;
+
+-- Q4: Búsqueda selectiva de actas por Hash SHA-256 y Año (KPI-02 < 10 s)
+SELECT f.SacramentoKey, t.Anio, ts.NombreSacramento, f.NumeroLibro, f.NumeroFolio, f.NumeroActa
+FROM dw.Fact_Sacramento f
+JOIN dw.Dim_Tiempo t ON f.TiempoKey = t.TiempoKey
+JOIN dw.Dim_TipoSacramento ts ON f.TipoSacramentoKey = ts.TipoSacramentoKey
+JOIN dw.Dim_Feligres fel ON f.FeligresKey = fel.FeligresKey
+WHERE t.Anio = 2024 AND ts.CodigoSacramento = 'BAU' AND fel.FeligresHash LIKE 'A%';
+
+SET STATISTICS TIME OFF;
+SET STATISTICS IO OFF;
+GO
